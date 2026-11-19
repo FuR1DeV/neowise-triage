@@ -1,0 +1,157 @@
+import { test, before, after } from "node:test";
+import assert from "node:assert/strict";
+import { createApp } from "../server.mjs";
+
+// Лимит из README. Берём число, а не константу из кода, чтобы тест ловил её изменение.
+const LIMIT_MS = 300;
+const MANUAL_REVIEW = { status: "manual_review", topic: null, draft: null };
+const silentLogger = { warn() {}, error() {} };
+
+// Поднимает сервер на свободном порту (port 0) и возвращает его адрес.
+async function startServer(options = {}) {
+  const server = createApp({ logger: silentLogger, ...options });
+  await new Promise((done) => server.listen(0, "127.0.0.1", done));
+  return { server, url: `http://127.0.0.1:${server.address().port}/api/triage` };
+}
+
+function post(url, body) {
+  return fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    // Строку и байты отправляем как есть, объект превращаем в JSON.
+    body: typeof body === "string" || body instanceof Uint8Array ? body : JSON.stringify(body),
+  });
+}
+
+let app;
+before(async () => {
+  app = await startServer();
+});
+after(() => app.server.close());
+
+test("обычный текст: ready с темой и черновиком", async () => {
+  const reply = await post(app.url, { text: "Когда будет доставка заказа?" });
+  assert.equal(reply.status, 200);
+  const data = await reply.json();
+  assert.deepEqual(Object.keys(data).sort(), ["draft", "status", "topic"]);
+  assert.equal(data.status, "ready");
+  assert.equal(data.topic, "delivery");
+  assert.ok(data.draft.trim().length > 0);
+});
+
+for (const label of ["[timeout]", "[error]", "[bad-json]", "[bad-topic]", "[empty-draft]"]) {
+  test(`сбой модели ${label}: manual_review`, async () => {
+    const reply = await post(app.url, { text: `Сколько стоит доставка? ${label}` });
+    assert.equal(reply.status, 200);
+    assert.deepEqual(await reply.json(), MANUAL_REVIEW);
+  });
+}
+
+test("таймаут: ответ приходит примерно через 300 мс, а не через 1,2 с", async () => {
+  const startedAt = performance.now();
+  const reply = await post(app.url, { text: "Нужна консультация [timeout]" });
+  const elapsed = performance.now() - startedAt;
+  assert.deepEqual(await reply.json(), MANUAL_REVIEW);
+  assert.ok(elapsed >= LIMIT_MS - 20, `слишком рано: ${elapsed} мс`);
+  assert.ok(elapsed < LIMIT_MS + 300, `слишком долго: ${elapsed} мс`);
+});
+
+test("модель игнорирует сигнал отмены: manual_review по таймауту, сигнал всё равно отправлен", async () => {
+  let signal;
+  const hanging = await startServer({
+    classify: (_text, options) => {
+      signal = options.signal;
+      return new Promise(() => {});
+    },
+  });
+  try {
+    const startedAt = performance.now();
+    const reply = await post(hanging.url, { text: "Обычная заявка" });
+    const elapsed = performance.now() - startedAt;
+    assert.deepEqual(await reply.json(), MANUAL_REVIEW);
+    assert.ok(elapsed >= LIMIT_MS - 20 && elapsed < LIMIT_MS + 300, `${elapsed} мс`);
+    assert.equal(signal.aborted, true);
+  } finally {
+    hanging.server.close();
+  }
+});
+
+test("лишние поля из ответа модели не уходят клиенту", async () => {
+  const chatty = await startServer({
+    classify: async () => JSON.stringify({ topic: "other", draft: "Ответ", internal: "секрет" }),
+  });
+  try {
+    const reply = await post(chatty.url, { text: "Вопрос" });
+    assert.deepEqual(await reply.json(), { status: "ready", topic: "other", draft: "Ответ" });
+  } finally {
+    chatty.server.close();
+  }
+});
+
+for (const value of [null, undefined]) {
+  test(`модель отказала значением ${value}: manual_review, а не 500`, async () => {
+    const broken = await startServer({ classify: () => Promise.reject(value) });
+    try {
+      const reply = await post(broken.url, { text: "Вопрос" });
+      assert.equal(reply.status, 200);
+      assert.deepEqual(await reply.json(), MANUAL_REVIEW);
+    } finally {
+      broken.server.close();
+    }
+  });
+}
+
+test("текст заявки не попадает в лог, даже если модель вернула его в ошибке", async () => {
+  const lines = [];
+  const logger = { warn: (line) => lines.push(line), error: (line) => lines.push(line) };
+  const secret = "Паспорт 4510 123456";
+  const leaky = await startServer({
+    logger,
+    classify: async (text) => {
+      throw new Error(`provider rejected prompt: ${text}`);
+    },
+  });
+  try {
+    const reply = await post(leaky.url, { text: secret });
+    assert.deepEqual(await reply.json(), MANUAL_REVIEW);
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /reason=model_error/);
+    assert.ok(!lines[0].includes(secret), lines[0]);
+  } finally {
+    leaky.server.close();
+  }
+});
+
+const invalidBodies = {
+  "пустое тело": "",
+  "битый JSON": "{text:",
+  "null": "null",
+  "массив": "[]",
+  "строка вместо объекта": '"Когда доставка?"',
+  "нет поля text": {},
+  "text пустой": { text: "" },
+  "text из пробелов": { text: "  \n\t " },
+  "text число": { text: 42 },
+  "text null": { text: null },
+  "невалидный UTF-8": Buffer.concat([Buffer.from('{"text":"'), Buffer.from([0xff, 0xfe]), Buffer.from('"}')]),
+};
+
+for (const [name, body] of Object.entries(invalidBodies)) {
+  test(`невалидный ввод (${name}): 400 invalid_input`, async () => {
+    const reply = await post(app.url, body);
+    assert.equal(reply.status, 400);
+    assert.deepEqual(await reply.json(), { status: "invalid_input" });
+  });
+}
+
+test("тело больше 64 КБ: 413 too_large", async () => {
+  const reply = await post(app.url, { text: "x".repeat(70 * 1024) });
+  assert.equal(reply.status, 413);
+  assert.deepEqual(await reply.json(), { status: "too_large" });
+});
+
+test("длинная заявка в пределах лимита обрабатывается", async () => {
+  const reply = await post(app.url, { text: "Когда доставка? ".repeat(2000) });
+  assert.equal(reply.status, 200);
+  assert.equal((await reply.json()).status, "ready");
+});
