@@ -18,7 +18,8 @@ function post(url, body) {
   return fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: typeof body === "string" ? body : JSON.stringify(body),
+    // Строку и байты отправляем как есть, объект превращаем в JSON.
+    body: typeof body === "string" || body instanceof Uint8Array ? body : JSON.stringify(body),
   });
 }
 
@@ -132,6 +133,7 @@ const invalidBodies = {
   "text из пробелов": { text: "  \n\t " },
   "text число": { text: 42 },
   "text null": { text: null },
+  "невалидный UTF-8": Buffer.concat([Buffer.from('{"text":"'), Buffer.from([0xff, 0xfe]), Buffer.from('"}')]),
 };
 
 for (const [name, body] of Object.entries(invalidBodies)) {
@@ -141,3 +143,15 @@ for (const [name, body] of Object.entries(invalidBodies)) {
     assert.deepEqual(await reply.json(), { status: "invalid_input" });
   });
 }
+
+test("тело больше 64 КБ: 413 too_large", async () => {
+  const reply = await post(app.url, { text: "x".repeat(70 * 1024) });
+  assert.equal(reply.status, 413);
+  assert.deepEqual(await reply.json(), { status: "too_large" });
+});
+
+test("длинная заявка в пределах лимита обрабатывается", async () => {
+  const reply = await post(app.url, { text: "Когда доставка? ".repeat(2000) });
+  assert.equal(reply.status, 200);
+  assert.equal((await reply.json()).status, "ready");
+});

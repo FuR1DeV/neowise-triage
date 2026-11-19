@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { classify as mockClassify } from "./mock-ai.mjs";
 
 export const AI_TIMEOUT_MS = 300;
+export const MAX_BODY_BYTES = 64 * 1024;
 const TOPICS = new Set(["delivery", "pricing", "other"]);
 const MANUAL_REVIEW = { status: "manual_review", topic: null, draft: null };
 
@@ -23,18 +24,27 @@ function json(response, status, body) {
   response.end(JSON.stringify(body));
 }
 
+// Читаем тело до конца, но храним не больше MAX_BODY_BYTES, чтобы огромный
+// запрос не съел память. Возвращает Buffer или null, если тело слишком большое.
 async function readBody(request) {
   const chunks = [];
-  for await (const chunk of request) chunks.push(chunk);
-  return Buffer.concat(chunks).toString("utf8");
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size <= MAX_BODY_BYTES) chunks.push(chunk);
+  }
+  return size > MAX_BODY_BYTES ? null : Buffer.concat(chunks);
 }
 
-// Ввод менеджера: JSON-объект с непустым полем text. Строка из одних пробелов
-// считается пустой. Возвращает текст или null, если ввод не подходит.
+// fatal: невалидный UTF-8 даёт ошибку, а не тихую замену символов на «�».
+const utf8 = new TextDecoder("utf-8", { fatal: true });
+
+// Ввод менеджера: JSON-объект в UTF-8 с непустым полем text. Строка из одних
+// пробелов считается пустой. Возвращает текст или null, если ввод не подходит.
 export function parseInput(rawBody) {
   let body;
   try {
-    body = JSON.parse(rawBody);
+    body = JSON.parse(utf8.decode(rawBody));
   } catch {
     return null;
   }
@@ -85,7 +95,9 @@ async function classifyWithTimeout(classify, text, timeoutMs) {
 
 export function createApp({ classify = mockClassify, timeoutMs = AI_TIMEOUT_MS, logger = console } = {}) {
   async function handleTriage(request, response) {
-    const text = parseInput(await readBody(request));
+    const body = await readBody(request);
+    if (body === null) return json(response, 413, { status: "too_large" });
+    const text = parseInput(body);
     if (text === null) return json(response, 400, { status: "invalid_input" });
 
     const startedAt = Date.now();
