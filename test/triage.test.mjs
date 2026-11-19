@@ -77,6 +77,40 @@ test("лишние поля из ответа модели не уходят к�
   }
 });
 
+for (const value of [null, undefined]) {
+  test(`модель отказала значением ${value}: manual_review, а не 500`, async () => {
+    const broken = await startServer({ classify: () => Promise.reject(value) });
+    try {
+      const reply = await post(broken.url, { text: "Вопрос" });
+      assert.equal(reply.status, 200);
+      assert.deepEqual(await reply.json(), MANUAL_REVIEW);
+    } finally {
+      broken.server.close();
+    }
+  });
+}
+
+test("текст заявки не попадает в лог, даже если модель вернула его в ошибке", async () => {
+  const lines = [];
+  const logger = { warn: (line) => lines.push(line), error: (line) => lines.push(line) };
+  const secret = "Паспорт 4510 123456";
+  const leaky = await startServer({
+    logger,
+    classify: async (text) => {
+      throw new Error(`provider rejected prompt: ${text}`);
+    },
+  });
+  try {
+    const reply = await post(leaky.url, { text: secret });
+    assert.deepEqual(await reply.json(), MANUAL_REVIEW);
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /reason=model_error/);
+    assert.ok(!lines[0].includes(secret), lines[0]);
+  } finally {
+    leaky.server.close();
+  }
+});
+
 const invalidBodies = {
   "пустое тело": "",
   "битый JSON": "{text:",

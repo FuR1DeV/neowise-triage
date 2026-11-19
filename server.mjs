@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
+import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { classify as mockClassify } from "./mock-ai.mjs";
 
@@ -11,6 +11,12 @@ const MANUAL_REVIEW = { status: "manual_review", topic: null, draft: null };
 const html = await readFile(new URL("./index.html", import.meta.url));
 
 class AiTimeoutError extends Error {}
+
+// Сообщение ошибки провайдера может содержать текст заявки, поэтому в лог
+// пишем только тип ошибки. Отказ может прийти и не объектом Error (null, строка).
+function errorKind(error) {
+  return error instanceof Error ? error.name : typeof error;
+}
 
 function json(response, status, body) {
   response.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -91,7 +97,7 @@ export function createApp({ classify = mockClassify, timeoutMs = AI_TIMEOUT_MS, 
       }
       reason = result.reason;
     } catch (error) {
-      reason = error instanceof AiTimeoutError ? "timeout" : `model_error: ${error.message}`;
+      reason = error instanceof AiTimeoutError ? "timeout" : `model_error:${errorKind(error)}`;
     }
     // В лог пишем причину и длину текста, но не сам текст заявки.
     logger.warn(
@@ -112,15 +118,25 @@ export function createApp({ classify = mockClassify, timeoutMs = AI_TIMEOUT_MS, 
     try {
       await handleTriage(request, response);
     } catch (error) {
-      logger.error(`[triage] server_error: ${error.message}`);
+      logger.error(`[triage] server_error: ${errorKind(error)} ${error?.message ?? ""}`);
       json(response, 500, { status: "server_error" });
     }
   });
 }
 
 // Сервер слушает порт только при прямом запуске (node server.mjs), а тесты
-// импортируют createApp и поднимают его сами на свободном порту.
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// импортируют createApp и поднимают его сами на свободном порту. realpath нужен,
+// потому что Node раскрывает симлинки в import.meta.url, а в argv[1] нет.
+function isDirectRun() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectRun()) {
   const port = Number(process.env.PORT || 3000);
   createApp().listen(port, "127.0.0.1", () => {
     console.log(`Triage server: http://127.0.0.1:${port}`);
