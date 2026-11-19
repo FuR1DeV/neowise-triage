@@ -44,6 +44,8 @@
 
     // Номер последнего запроса: ответ на более ранний запрос не перезапишет свежий.
     let lastRequestId = 0;
+    // Контроллер текущего запроса: новый запрос отменяет предыдущий.
+    let currentRequest = null;
 
     function showStatus(text, kind) {
       status.textContent = text;
@@ -67,6 +69,8 @@
         showStatus("Не удалось подготовить черновик автоматически. Разберите заявку вручную.", "manual");
       } else if (httpStatus === 400 && data?.status === "invalid_input") {
         showStatus("Введите текст заявки: поле пустое.", "error");
+      } else if (httpStatus === 413) {
+        showStatus("Текст заявки слишком длинный. Сократите его и попробуйте ещё раз.", "error");
       } else {
         showStatus(`Сервер ответил ошибкой (код ${httpStatus}). Попробуйте ещё раз.`, "error");
       }
@@ -75,6 +79,10 @@
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const requestId = ++lastRequestId;
+      currentRequest?.abort();
+      const controller = new AbortController();
+      currentRequest = controller;
+      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
       clearResult();
       showStatus("Разбираем заявку…", "pending");
       button.disabled = true;
@@ -83,7 +91,7 @@
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text: message.value }),
-          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          signal: controller.signal,
         });
         const data = await reply.json().catch(() => null);
         if (requestId !== lastRequestId) return;
@@ -92,6 +100,7 @@
         if (requestId !== lastRequestId) return;
         showStatus("Нет ответа от сервера. Проверьте соединение и попробуйте ещё раз.", "error");
       } finally {
+        clearTimeout(timer);
         if (requestId === lastRequestId) button.disabled = false;
       }
     });
