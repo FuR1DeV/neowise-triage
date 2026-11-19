@@ -1,7 +1,9 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { createApp, AI_TIMEOUT_MS } from "../server.mjs";
+import { createApp } from "../server.mjs";
 
+// Лимит из README. Берём число, а не константу из кода, чтобы тест ловил её изменение.
+const LIMIT_MS = 300;
 const MANUAL_REVIEW = { status: "manual_review", topic: null, draft: null };
 const silentLogger = { warn() {}, error() {} };
 
@@ -49,17 +51,25 @@ test("таймаут: ответ приходит примерно через 30
   const reply = await post(app.url, { text: "Нужна консультация [timeout]" });
   const elapsed = performance.now() - startedAt;
   assert.deepEqual(await reply.json(), MANUAL_REVIEW);
-  assert.ok(elapsed >= AI_TIMEOUT_MS - 20, `слишком рано: ${elapsed} мс`);
-  assert.ok(elapsed < AI_TIMEOUT_MS + 300, `слишком долго: ${elapsed} мс`);
+  assert.ok(elapsed >= LIMIT_MS - 20, `слишком рано: ${elapsed} мс`);
+  assert.ok(elapsed < LIMIT_MS + 300, `слишком долго: ${elapsed} мс`);
 });
 
-test("модель игнорирует сигнал отмены: всё равно manual_review по таймауту", async () => {
-  const hanging = await startServer({ classify: () => new Promise(() => {}) });
+test("модель игнорирует сигнал отмены: manual_review по таймауту, сигнал всё равно отправлен", async () => {
+  let signal;
+  const hanging = await startServer({
+    classify: (_text, options) => {
+      signal = options.signal;
+      return new Promise(() => {});
+    },
+  });
   try {
     const startedAt = performance.now();
     const reply = await post(hanging.url, { text: "Обычная заявка" });
+    const elapsed = performance.now() - startedAt;
     assert.deepEqual(await reply.json(), MANUAL_REVIEW);
-    assert.ok(performance.now() - startedAt < AI_TIMEOUT_MS + 300);
+    assert.ok(elapsed >= LIMIT_MS - 20 && elapsed < LIMIT_MS + 300, `${elapsed} мс`);
+    assert.equal(signal.aborted, true);
   } finally {
     hanging.server.close();
   }
